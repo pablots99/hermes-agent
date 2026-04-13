@@ -190,7 +190,8 @@ class GatewayAuthorizationMixin:
         # connection, so HA events are always authorized.
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
-        if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
+        # Linear Agent Session webhooks are likewise authenticated upstream.
+        if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.LINEAR}:
             return True
 
         user_id = source.user_id

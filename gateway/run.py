@@ -7132,6 +7132,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             return MSGraphWebhookAdapter(config)
 
+        elif platform == Platform.LINEAR:
+            from gateway.platforms.linear import LinearAdapter, check_linear_requirements
+            if not check_linear_requirements():
+                logger.warning("Linear: aiohttp not installed")
+                return None
+            return LinearAdapter(config)
+
         elif platform == Platform.BLUEBUBBLES:
             from gateway.platforms.bluebubbles import BlueBubblesAdapter, check_bluebubbles_requirements
             if not check_bluebubbles_requirements():
@@ -9373,8 +9380,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 context_prompt += _intro_note
         
         # One-time prompt if no home channel is set for this platform
-        # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        # Skip for webhooks and Linear Agent Sessions — they don't use home-channel delivery.
+        if not history and source.platform and source.platform != Platform.LOCAL and source.platform not in (Platform.WEBHOOK, Platform.LINEAR):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             if not os.getenv(env_key):
@@ -14388,12 +14395,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        tool_progress_enabled = progress_mode != "off" and source.platform not in (Platform.WEBHOOK, Platform.LINEAR)
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
         interim_assistant_messages_enabled = (
-            source.platform != Platform.WEBHOOK
+            source.platform not in (Platform.WEBHOOK, Platform.LINEAR)
             and _resolve_gateway_display_bool(
                 user_config,
                 platform_key,
