@@ -120,6 +120,7 @@ class Platform(Enum):
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
     MSGRAPH_WEBHOOK = "msgraph_webhook"
+    LINEAR = "linear"
     FEISHU = "feishu"
     WECOM = "wecom"
     WECOM_CALLBACK = "wecom_callback"
@@ -249,7 +250,7 @@ class SessionResetPolicy:
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
     notify: bool = True  # Send a notification to the user when auto-reset occurs
-    notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
+    notify_exclude_platforms: tuple = ("api_server", "webhook", "linear")  # Platforms that don't get reset notifications
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -273,7 +274,7 @@ class SessionResetPolicy:
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
             notify=_coerce_bool(notify, True),
-            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
+            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook", "linear"),
         )
 
 
@@ -418,6 +419,11 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.API_SERVER: lambda cfg: True,
     Platform.WEBHOOK: lambda cfg: True,
     Platform.MSGRAPH_WEBHOOK: lambda cfg: True,
+    Platform.LINEAR: lambda cfg: bool(
+        cfg.extra.get("client_id")
+        and cfg.extra.get("client_secret")
+        and cfg.extra.get("webhook_secret")
+    ),
     Platform.FEISHU: lambda cfg: bool(cfg.extra.get("app_id")),
     Platform.WECOM: lambda cfg: bool(cfg.extra.get("bot_id")),
     Platform.WECOM_CALLBACK: lambda cfg: bool(
@@ -1586,6 +1592,37 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 name=os.getenv("DINGTALK_HOME_CHANNEL_NAME", "Home"),
                 thread_id=os.getenv("DINGTALK_HOME_CHANNEL_THREAD_ID") or None,
             )
+    # Linear agent platform
+    linear_enabled = os.getenv("LINEAR_ENABLED", "").lower() in ("true", "1", "yes")
+    linear_client_id = os.getenv("LINEAR_CLIENT_ID", "")
+    linear_client_secret = os.getenv("LINEAR_CLIENT_SECRET", "")
+    linear_webhook_secret = os.getenv("LINEAR_WEBHOOK_SECRET", "")
+    linear_public_base_url = os.getenv("LINEAR_PUBLIC_BASE_URL", "")
+    linear_host = os.getenv("LINEAR_HOST", "")
+    linear_port = os.getenv("LINEAR_PORT", "")
+    linear_scopes = os.getenv("LINEAR_SCOPES", "")
+    if linear_enabled or linear_client_id or linear_client_secret or linear_webhook_secret:
+        if Platform.LINEAR not in config.platforms:
+            config.platforms[Platform.LINEAR] = PlatformConfig()
+        config.platforms[Platform.LINEAR].enabled = True
+        linear_extra = config.platforms[Platform.LINEAR].extra
+        if linear_client_id:
+            linear_extra["client_id"] = linear_client_id
+        if linear_client_secret:
+            linear_extra["client_secret"] = linear_client_secret
+        if linear_webhook_secret:
+            linear_extra["webhook_secret"] = linear_webhook_secret
+        if linear_public_base_url:
+            linear_extra["public_base_url"] = linear_public_base_url.rstrip("/")
+        if linear_host:
+            linear_extra["host"] = linear_host
+        if linear_port:
+            try:
+                linear_extra["port"] = int(linear_port)
+            except ValueError:
+                pass
+        if linear_scopes:
+            linear_extra["scopes"] = [scope.strip() for scope in linear_scopes.split(",") if scope.strip()]
 
     # Feishu / Lark
     feishu_app_id = os.getenv("FEISHU_APP_ID")
