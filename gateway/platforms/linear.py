@@ -46,6 +46,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.session import build_session_key
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,17 @@ DEFAULT_TESTING_STATE_NAME = "Testing"
 DEFAULT_TESTING_FALLBACK_STATE_NAME = "In Review"
 DEFAULT_IN_REVIEW_STATE_NAME = "In Review"
 DEFAULT_DONE_STATE_NAME = "Done"
+DEFAULT_BACKLOG_STATE_NAME = "Backlog"
+DEFAULT_RECONCILE_INTERVAL_SECONDS = 60
+DEFAULT_RECONCILE_LEASE_SECONDS = 300
+VALID_WORKFLOW_DECISIONS = {
+    "done",
+    "ready_for_testing",
+    "backlog",
+    "stay_in_progress",
+    "change_scope",
+    "needs_human_review",
+}
 
 
 def check_linear_requirements() -> bool:
@@ -141,6 +153,11 @@ class LinearAdapter(BasePlatformAdapter):
         self._testing_fallback_state_name = str(extra.get("testing_fallback_state_name") or DEFAULT_TESTING_FALLBACK_STATE_NAME)
         self._in_review_state_name = str(extra.get("in_review_state_name") or DEFAULT_IN_REVIEW_STATE_NAME)
         self._done_state_name = str(extra.get("done_state_name") or DEFAULT_DONE_STATE_NAME)
+        self._backlog_state_name = str(extra.get("backlog_state_name") or DEFAULT_BACKLOG_STATE_NAME)
+        self._reconcile_interval_seconds = max(0, int(extra.get("reconcile_interval_seconds") or DEFAULT_RECONCILE_INTERVAL_SECONDS))
+        self._reconcile_lease_seconds = max(self._reconcile_interval_seconds, int(extra.get("reconcile_lease_seconds") or DEFAULT_RECONCILE_LEASE_SECONDS))
+        self._reconcile_task: Optional[asyncio.Task] = None
+        self._reconciled_issue_leases: Dict[str, Dict[str, Any]] = {}
         self._session_semaphore = asyncio.Semaphore(self._max_concurrent_sessions)
         self._session_counter_lock = asyncio.Lock()
         self._running_session_count = 0
@@ -394,6 +411,131 @@ class LinearAdapter(BasePlatformAdapter):
             "next_attempt": next_attempt,
         }
 
+    def _resolve_success_workflow_decision(self, session: Dict[str, Any]) -> str:
+        execution_mode = str(session.get("execution_mode") or self._default_execution_mode)
+        decision = str(session.get("workflow_decision") or "").strip().lower()
+        if decision in VALID_WORKFLOW_DECISIONS:
+            if execution_mode == "autonomous_dev" and decision == "ready_for_testing":
+                return "done"
+            if execution_mode == "human_gate" and decision in {"done", "ready_for_testing"}:
+                return "needs_human_review"
+            if execution_mode != "autonomous_dev" and decision == "done":
+                return "needs_human_review" if execution_mode == "human_gate" else "ready_for_testing"
+            return decision
+        if execution_mode == "autonomous_dev":
+            return "done"
+        if execution_mode == "human_gate":
+            return "needs_human_review"
+        return "ready_for_testing"
+
+    def _classify_success_rerun_budget(self, session: Dict[str, Any]) -> Dict[str, Any]:
+        current_count = int(session.get("success_rerun_count") or 0)
+        max_reruns = max(1, int(session.get("max_success_reruns") or 3))
+        allowed = current_count < max_reruns
+        next_count = current_count + 1 if allowed else current_count
+        return {
+            "current_count": current_count,
+            "max_reruns": max_reruns,
+            "allowed": allowed,
+            "next_count": next_count,
+        }
+
+    def _build_scope_followup_title(self, session: Dict[str, Any]) -> str:
+        base_title = str(session.get("issue_title") or session.get("issue_identifier") or "Follow-up slice").strip()
+        suffix = " — follow-up slice"
+        if base_title.endswith(suffix):
+            return base_title
+        max_base_len = 140 - len(suffix)
+        if len(base_title) > max_base_len:
+            base_title = base_title[: max_base_len - 1].rstrip() + "…"
+        return f"{base_title}{suffix}"
+
+    def _build_scope_followup_description(self, session: Dict[str, Any], reason: str) -> str:
+        issue_identifier = str(session.get("issue_identifier") or session.get("issue_id") or "this issue").strip()
+        issue_title = str(session.get("issue_title") or "").strip()
+        lines = [
+            f"Autonomous follow-up created by Jax while narrowing scope for {issue_identifier}.",
+        ]
+        if issue_title:
+            lines.append(f"Parent issue title: {issue_title}")
+        if reason:
+            lines.append(f"Why Jax narrowed scope: {reason}")
+        lines.append("Purpose: track deferred remaining scope that was split out while the current issue continues on the active slice.")
+        return "\n\n".join(lines)
+
+    async def _create_followup_issue(
+        self,
+        session: Dict[str, Any],
+        *,
+        title: str,
+        description: str,
+    ) -> Dict[str, Any]:
+        team_id = str(session.get("team_id") or "").strip()
+        app_user_id = str(session.get("app_user_id") or "").strip()
+        if not team_id or not app_user_id:
+            raise RuntimeError("Missing team_id or app_user_id for Linear follow-up creation")
+        access_token = await self._ensure_access_token(app_user_id)
+        issue_id = str(session.get("issue_id") or "").strip()
+        project_id = str(session.get("project_id") or "").strip()
+        assignee_id = str(session.get("current_assignee_id") or "").strip()
+        input_payload: Dict[str, Any] = {
+            "teamId": team_id,
+            "title": title,
+            "description": description,
+        }
+        if issue_id:
+            input_payload["parentId"] = issue_id
+        if project_id:
+            input_payload["projectId"] = project_id
+        if assignee_id:
+            input_payload["assigneeId"] = assignee_id
+        payload = {
+            "query": (
+                "mutation($input: IssueCreateInput!) { "
+                "issueCreate(input: $input) { success issue { id identifier title } } }"
+            ),
+            "variables": {"input": input_payload},
+        }
+        result = await asyncio.to_thread(
+            self._http_json,
+            "https://api.linear.app/graphql",
+            payload,
+            {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        errors = result.get("errors") or []
+        if errors:
+            raise RuntimeError(errors[0].get("message") or str(errors[0]))
+        create_payload = ((result.get("data") or {}).get("issueCreate") or {})
+        if not create_payload.get("success"):
+            raise RuntimeError(f"issueCreate failed: {result}")
+        return (create_payload.get("issue") or {})
+
+    async def _ensure_scope_followup_issue(self, session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        reason = str(session.get("workflow_decision_reason") or "").strip()
+        existing_identifier = str(session.get("scope_followup_issue_identifier") or "").strip()
+        existing_reason = str(session.get("scope_followup_issue_reason") or "").strip()
+        if existing_identifier and existing_reason == reason:
+            return {
+                "id": str(session.get("scope_followup_issue_id") or "").strip(),
+                "identifier": existing_identifier,
+                "title": str(session.get("scope_followup_issue_title") or "").strip(),
+            }
+        if not reason:
+            return None
+        followup = await self._create_followup_issue(
+            session,
+            title=self._build_scope_followup_title(session),
+            description=self._build_scope_followup_description(session, reason),
+        )
+        session["scope_followup_issue_reason"] = reason
+        session["scope_followup_issue_id"] = str(followup.get("id") or "").strip() or None
+        session["scope_followup_issue_identifier"] = str(followup.get("identifier") or "").strip() or None
+        session["scope_followup_issue_title"] = str(followup.get("title") or "").strip() or None
+        return followup
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -439,6 +581,10 @@ class LinearAdapter(BasePlatformAdapter):
             self._site = web.TCPSite(self._runner, self._host, self._port)
             await self._site.start()
             self._mark_connected()
+            if self._reconcile_interval_seconds > 0:
+                self._reconcile_task = asyncio.create_task(self._reconcile_delegated_started_issues_loop())
+                self._background_tasks.add(self._reconcile_task)
+                self._reconcile_task.add_done_callback(self._background_tasks.discard)
             logger.info(
                 "[linear] Listening on %s:%d (authorize=%s callback=%s webhook=%s)",
                 self._host,
@@ -453,6 +599,13 @@ class LinearAdapter(BasePlatformAdapter):
             raise
 
     async def disconnect(self) -> None:
+        if self._reconcile_task is not None:
+            self._reconcile_task.cancel()
+            try:
+                await self._reconcile_task
+            except asyncio.CancelledError:
+                pass
+            self._reconcile_task = None
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -476,16 +629,26 @@ class LinearAdapter(BasePlatformAdapter):
         ephemeral = bool((metadata or {}).get("ephemeral", False))
         signal = (metadata or {}).get("signal")
         try:
-            result = await self._create_activity(
-                app_user_id=session["app_user_id"],
-                agent_session_id=session["agent_session_id"],
-                activity_type=activity_type,
-                body=content,
-                ephemeral=ephemeral,
-                signal=signal,
-            )
-            activity = ((result or {}).get("agentActivityCreate") or {}).get("agentActivity") or {}
-            return SendResult(success=True, message_id=activity.get("id"))
+            if session.get("agent_session_id"):
+                result = await self._create_activity(
+                    app_user_id=session["app_user_id"],
+                    agent_session_id=session["agent_session_id"],
+                    activity_type=activity_type,
+                    body=content,
+                    ephemeral=ephemeral,
+                    signal=signal,
+                )
+                activity = ((result or {}).get("agentActivityCreate") or {}).get("agentActivity") or {}
+                return SendResult(success=True, message_id=activity.get("id"))
+            if session.get("issue_id"):
+                result = await self._create_issue_comment(
+                    app_user_id=session["app_user_id"],
+                    issue_id=session["issue_id"],
+                    body=content,
+                )
+                comment = ((result or {}).get("commentCreate") or {}).get("comment") or {}
+                return SendResult(success=True, message_id=comment.get("id"))
+            return SendResult(success=False, error=f"Linear session {chat_id} has no agent session or issue target")
         except Exception as exc:
             logger.error("[linear] Failed to send activity for %s: %s", chat_id, exc)
             return SendResult(success=False, error=str(exc))
@@ -498,6 +661,256 @@ class LinearAdapter(BasePlatformAdapter):
             "chat_id": chat_id,
             "session_metadata": dict(info) if info else {},
         }
+
+    def _extract_workflow_decision_from_response(self, response: str) -> tuple[str, Optional[Dict[str, str]]]:
+        if not response:
+            return response, None
+        match = re.search(r"```hermes_workflow\s*(\{.*?\})\s*```\s*$", response, re.DOTALL | re.IGNORECASE)
+        if not match:
+            return response, None
+        try:
+            payload = json.loads(match.group(1))
+        except Exception:
+            return response, None
+        decision = str(payload.get("decision") or "").strip().lower()
+        if decision not in VALID_WORKFLOW_DECISIONS:
+            return response, None
+        reason = str(payload.get("reason") or "").strip()
+        cleaned = (response[:match.start()] + response[match.end():]).strip()
+        metadata = {"decision": decision}
+        if reason:
+            metadata["reason"] = reason
+        return cleaned, metadata
+
+    def apply_agent_result_metadata(self, chat_id: str, agent_result: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(agent_result, dict):
+            return agent_result
+        session = self._session_info.get(chat_id)
+        if not session:
+            return agent_result
+        session.pop("workflow_decision", None)
+        session.pop("workflow_decision_reason", None)
+        final_response = str(agent_result.get("final_response") or "")
+        cleaned_response, workflow = self._extract_workflow_decision_from_response(final_response)
+        if workflow:
+            session["workflow_decision"] = workflow["decision"]
+            if workflow.get("reason"):
+                session["workflow_decision_reason"] = workflow["reason"]
+            agent_result["final_response"] = cleaned_response
+            messages = agent_result.get("messages")
+            if isinstance(messages, list):
+                for message in reversed(messages):
+                    if isinstance(message, dict) and message.get("role") == "assistant":
+                        content = message.get("content")
+                        if isinstance(content, str):
+                            message["content"] = cleaned_response
+                        break
+        return agent_result
+
+    def _build_reconciled_issue_chat_id(self, issue_id: str) -> str:
+        return f"linear:issue:{issue_id}"
+
+    def _should_reconcile_issue(self, issue: Dict[str, Any]) -> bool:
+        issue_id = str(issue.get("id") or issue.get("identifier") or "").strip()
+        if not issue_id:
+            return False
+        state_name = str((issue.get("state") or {}).get("name") or "").strip().lower()
+        excluded_state_names = {
+            self._testing_state_name.strip().lower(),
+            self._testing_fallback_state_name.strip().lower(),
+            self._in_review_state_name.strip().lower(),
+            self._blocked_state_name.strip().lower(),
+            self._backlog_state_name.strip().lower(),
+            self._done_state_name.strip().lower(),
+        }
+        if state_name and state_name in excluded_state_names:
+            return False
+        lease = self._reconciled_issue_leases.get(issue_id) or {}
+        updated_at = str(issue.get("updatedAt") or "").strip()
+        leased_at = float(lease.get("leased_at") or 0)
+        leased_updated_at = str(lease.get("updated_at") or "").strip()
+        if leased_at and leased_updated_at and leased_updated_at == updated_at:
+            if time.time() - leased_at < self._reconcile_lease_seconds:
+                return False
+        return True
+
+    def _build_reconciled_issue_prompt(self, issue: Dict[str, Any], session: Dict[str, Any]) -> str:
+        issue_identifier = str(issue.get("identifier") or issue.get("id") or "").strip()
+        issue_title = str(issue.get("title") or "").strip()
+        issue_description = str(issue.get("description") or "").strip()
+        project_name = str((issue.get("project") or {}).get("name") or session.get("project_name") or "").strip()
+        execution_mode = str(session.get("execution_mode") or self._default_execution_mode)
+        allowed_decisions = ["backlog", "stay_in_progress", "change_scope", "needs_human_review"]
+        if execution_mode == "autonomous_dev":
+            allowed_decisions = ["done", *allowed_decisions]
+        else:
+            allowed_decisions = ["ready_for_testing", *allowed_decisions]
+        example_decision = allowed_decisions[0]
+        return (
+            "A delegated Linear issue is already in progress and must continue autonomously now.\n\n"
+            f"Issue: {issue_identifier} {issue_title}\n"
+            f"Project: {project_name or '(none)'}\n"
+            f"Task type: {session.get('task_type', DEFAULT_TASK_TYPE)}\n"
+            f"Execution mode: {execution_mode}\n\n"
+            "Description:\n"
+            f"{issue_description or '(no description)'}\n\n"
+            "At the end of your visible response, append a fenced `hermes_workflow` JSON block like:\n"
+            "```hermes_workflow\n"
+            f'{{"decision": "{example_decision}", "reason": "brief rationale"}}\n'
+            "```\n"
+            f"Allowed decisions: {', '.join(allowed_decisions)}."
+        )
+
+    def _store_reconciled_issue_session(self, issue: Dict[str, Any], app_user_id: str) -> Dict[str, Any]:
+        issue_id = str(issue.get("id") or issue.get("identifier") or "").strip()
+        chat_id = self._build_reconciled_issue_chat_id(issue_id)
+        project = issue.get("project") or {}
+        assignee = issue.get("assignee") or {}
+        creator = issue.get("creator") or {}
+        policy = self._build_execution_policy(issue)
+        session = {
+            "context_type": "linear_issue_reconcile",
+            "app_user_id": str(app_user_id or ""),
+            "chat_name": issue.get("identifier") or issue.get("title") or chat_id,
+            "issue_id": issue_id,
+            "issue_identifier": str(issue.get("identifier") or issue_id),
+            "issue_title": str(issue.get("title") or ""),
+            "team_id": str((issue.get("team") or {}).get("id") or issue.get("teamId") or ""),
+            "team_name": str((issue.get("team") or {}).get("name") or issue.get("team") or ""),
+            "project_id": str(project.get("id") or ""),
+            "project_name": str(project.get("name") or ""),
+            "project_key": self._normalize_project_key(project.get("name") or "") or None,
+            "label_names": self._extract_label_names(issue),
+            "creator_id": str(creator.get("id") or ""),
+            "creator_name": str(creator.get("name") or ""),
+            "current_assignee_id": str(assignee.get("id") or issue.get("assigneeId") or "") or None,
+            "current_assignee_name": str(assignee.get("name") or issue.get("assignee") or "") or None,
+            "updated_at": time.time(),
+            **policy,
+        }
+        self._session_info[chat_id] = session
+        return session
+
+    async def _create_issue_comment(self, *, app_user_id: str, issue_id: str, body: str) -> Dict[str, Any]:
+        access_token = await self._ensure_access_token(app_user_id)
+        payload = {
+            "query": (
+                "mutation($input: CommentCreateInput!) { "
+                "commentCreate(input: $input) { success comment { id body } } }"
+            ),
+            "variables": {"input": {"issueId": issue_id, "body": body}},
+        }
+        result = await asyncio.to_thread(
+            self._http_json,
+            "https://api.linear.app/graphql",
+            payload,
+            {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        errors = result.get("errors") or []
+        if errors:
+            raise RuntimeError(errors[0].get("message") or str(errors[0]))
+        create_payload = ((result.get("data") or {}).get("commentCreate") or {})
+        if not create_payload.get("success"):
+            raise RuntimeError(f"commentCreate failed: {result}")
+        return (result.get("data") or {})
+
+    async def _list_delegated_started_issues(self, app_user_id: str) -> List[Dict[str, Any]]:
+        access_token = await self._ensure_access_token(app_user_id)
+        issues: List[Dict[str, Any]] = []
+        after: Optional[str] = None
+        while True:
+            payload = {
+                "query": (
+                    "query($delegateId: ID!, $after: String) { "
+                    "issues(filter: { delegate: { id: { eq: $delegateId } }, state: { type: { eq: \"started\" } } }, first: 25, after: $after) { nodes { "
+                    "id identifier title description updatedAt state { name type } team { id name } project { id name } assignee { id name } creator { id name } labels { nodes { name } } "
+                    "} pageInfo { hasNextPage endCursor } } }"
+                ),
+                "variables": {"delegateId": app_user_id, "after": after},
+            }
+            result = await asyncio.to_thread(
+                self._http_json,
+                "https://api.linear.app/graphql",
+                payload,
+                {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            errors = result.get("errors") or []
+            if errors:
+                raise RuntimeError(errors[0].get("message") or str(errors[0]))
+            issues_payload = ((result.get("data") or {}).get("issues") or {})
+            issues.extend(issues_payload.get("nodes") or [])
+            page_info = issues_payload.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = str(page_info.get("endCursor") or "").strip() or None
+            if not after:
+                break
+        return issues
+
+    async def _reconcile_delegated_started_issues_once(self) -> None:
+        stored = self._load_json(self._tokens_path)
+        for app_user_id in list(stored.keys()):
+            if not str(app_user_id).strip():
+                continue
+            try:
+                issues = await self._list_delegated_started_issues(str(app_user_id))
+            except Exception:
+                logger.debug("[linear] Failed to reconcile delegated started issues for %s", app_user_id, exc_info=True)
+                continue
+            for issue in issues:
+                issue_id = str(issue.get("id") or issue.get("identifier") or "").strip()
+                if not issue_id or not self._should_reconcile_issue(issue):
+                    continue
+                chat_id = self._build_reconciled_issue_chat_id(issue_id)
+                source = self.build_source(
+                    chat_id=chat_id,
+                    chat_name=issue.get("identifier") or issue.get("title") or chat_id,
+                    chat_type="thread",
+                    user_id=f"linear:reconcile:{app_user_id}",
+                    user_name="Linear reconciler",
+                )
+                session_key = build_session_key(
+                    source,
+                    group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                    thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+                )
+                if session_key in self._active_sessions or session_key in self._pending_messages:
+                    continue
+                session = self._store_reconciled_issue_session(issue, str(app_user_id))
+                self._reconciled_issue_leases[issue_id] = {
+                    "updated_at": str(issue.get("updatedAt") or "").strip(),
+                    "leased_at": time.time(),
+                }
+                source = self.build_source(
+                    chat_id=chat_id,
+                    chat_name=session.get("chat_name") or chat_id,
+                    chat_type="thread",
+                    user_id=f"linear:reconcile:{app_user_id}",
+                    user_name="Linear reconciler",
+                )
+                event = MessageEvent(
+                    text=self._build_reconciled_issue_prompt(issue, session),
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    raw_message={"action": "reconcile", "issue": issue},
+                    message_id=f"{issue_id}:reconcile:{int(time.time() * 1000)}",
+                    internal=True,
+                )
+                await self.handle_message(event)
+
+    async def _reconcile_delegated_started_issues_loop(self) -> None:
+        try:
+            while True:
+                await self._reconcile_delegated_started_issues_once()
+                await asyncio.sleep(self._reconcile_interval_seconds)
+        except asyncio.CancelledError:
+            raise
 
     # ------------------------------------------------------------------
     # HTTP handlers
@@ -735,6 +1148,13 @@ class LinearAdapter(BasePlatformAdapter):
             f"Project execution mode: {session.get('execution_mode', self._default_execution_mode)}\n"
             f"Auto-executable by current Jax executor: {'yes' if session.get('can_execute', True) else 'no'}\n"
         )
+        execution_mode = str(session.get("execution_mode") or self._default_execution_mode)
+        allowed_decisions = ["backlog", "stay_in_progress", "change_scope", "needs_human_review"]
+        if execution_mode == "autonomous_dev":
+            allowed_decisions = ["done", *allowed_decisions]
+        else:
+            allowed_decisions = ["ready_for_testing", *allowed_decisions]
+        example_decision = allowed_decisions[0]
 
         if action == "created":
             prompt_context = payload.get("promptContext") or ""
@@ -746,7 +1166,13 @@ class LinearAdapter(BasePlatformAdapter):
                 f"{flow_context}"
                 f"Guidance:\n```json\n{guidance_text}\n```\n\n"
                 "Use the following Linear-provided promptContext as the authoritative context:\n\n"
-                f"```text\n{prompt_context[:12000]}\n```"
+                f"```text\n{prompt_context[:12000]}\n```\n\n"
+                "At the end of your visible response, append a machine-readable workflow block so Jax can route the issue correctly.\n"
+                "Format exactly like:\n"
+                "```hermes_workflow\n"
+                f'{{"decision": "{example_decision}", "reason": "brief rationale"}}\n'
+                "```\n"
+                f"Allowed decisions: {', '.join(allowed_decisions)}."
             )
 
         activity = payload.get("agentActivity") or {}
@@ -758,7 +1184,13 @@ class LinearAdapter(BasePlatformAdapter):
             f"Session URL: {session_url or '(unknown)'}\n"
             f"Issue: {issue_identifier} {issue_title}\n"
             f"Signal: {signal or '(none)'}\n"
-            f"User message:\n\n{body}"
+            f"User message:\n\n{body}\n\n"
+            "At the end of your visible response, append a machine-readable workflow block so Jax can route the issue correctly.\n"
+            "Format exactly like:\n"
+            "```hermes_workflow\n"
+            f'{{"decision": "{example_decision}", "reason": "brief rationale"}}\n'
+            "```\n"
+            f"Allowed decisions: {', '.join(allowed_decisions)}."
         )
 
     # ------------------------------------------------------------------
@@ -937,6 +1369,57 @@ class LinearAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[linear] Queue status activity failed for %s", chat_id, exc_info=True)
 
+    async def _schedule_autonomous_rerun(
+        self,
+        event: MessageEvent,
+        session: Dict[str, Any],
+        *,
+        rerun_kind: str,
+        reason: str,
+    ) -> None:
+        if rerun_kind == "retry":
+            prompt = (
+                "Retry the current issue autonomously. "
+                f"Previous workflow reason: {reason}. "
+                "Re-use the current context and continue from the last attempt."
+            )
+        elif rerun_kind == "continue":
+            prompt = (
+                "Continue the current issue autonomously from the last completed slice. "
+                f"Previous workflow reason: {reason}. "
+                "Do not restart from scratch; use the current context and execute the next concrete step."
+            )
+        else:
+            prompt = (
+                "Refit the current issue into a smaller executable slice and continue autonomously. "
+                f"Previous workflow reason: {reason}. "
+                "Rewrite the immediate objective into the next narrow step before continuing."
+            )
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        if session_key in self._pending_messages:
+            logger.debug("[linear] Skipping autonomous rerun for %s because a pending follow-up already exists", session_key)
+            return
+        rerun_event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=event.source,
+            raw_message={
+                "autonomous_rerun": True,
+                "rerun_kind": rerun_kind,
+                "reason": reason,
+                "issue_identifier": session.get("issue_identifier"),
+            },
+            message_id=f"{event.message_id or session.get('issue_identifier') or 'linear'}:rerun:{rerun_kind}:{int(time.time() * 1000)}",
+            internal=True,
+        )
+        task = asyncio.create_task(self.handle_message(rerun_event))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         session = self._session_info.get(event.source.chat_id)
         if not session or not session.get("can_execute", True):
@@ -962,7 +1445,11 @@ class LinearAdapter(BasePlatformAdapter):
         if outcome.name == "SUCCESS":
             session["retry_requested"] = False
             session["retry_last_error_class"] = None
-            if execution_mode == "autonomous_dev":
+            workflow_decision = self._resolve_success_workflow_decision(session)
+            session["workflow_decision"] = workflow_decision
+            if workflow_decision not in {"stay_in_progress", "change_scope"}:
+                session["success_rerun_count"] = 0
+            if workflow_decision == "done":
                 await self._transition_issue_for_session(
                     session,
                     self._done_state_name,
@@ -971,12 +1458,85 @@ class LinearAdapter(BasePlatformAdapter):
                 )
                 return
 
-            if execution_mode == "human_gate":
+            if workflow_decision == "needs_human_review":
                 await self._transition_issue_for_session(
                     session,
                     self._in_review_state_name,
                     assignee_id=assignee_id,
-                    comment="Jax finished implementation work and left this issue in In Review for human approval.",
+                    comment="Jax needs human review before continuing this issue.",
+                )
+                return
+
+            if workflow_decision == "backlog":
+                await self._transition_issue_for_session(
+                    session,
+                    self._backlog_state_name,
+                    assignee_id=assignee_id,
+                    comment="Jax decided this issue should return to Backlog before more autonomous execution.",
+                )
+                return
+
+            if workflow_decision == "stay_in_progress":
+                rerun_budget = self._classify_success_rerun_budget(session)
+                if not rerun_budget["allowed"]:
+                    session["retrigger_requested"] = False
+                    await self._transition_issue_for_session(
+                        session,
+                        self._blocked_state_name,
+                        assignee_id=assignee_id,
+                        comment="Jax exhausted autonomous continuation attempts for this issue and moved it to Blocked for follow-up.",
+                    )
+                    return
+                session["success_rerun_count"] = rerun_budget["next_count"]
+                session["retrigger_requested"] = True
+                reason = str(session.get("workflow_decision_reason") or "partial_progress").strip() or "partial_progress"
+                await self._transition_issue_for_session(
+                    session,
+                    self._in_progress_state_name,
+                    assignee_id=assignee_id,
+                    comment="Jax made partial progress and is keeping this issue in In Progress for continued autonomous execution.",
+                )
+                await self._schedule_autonomous_rerun(
+                    event,
+                    session,
+                    rerun_kind="continue",
+                    reason=f"workflow_decision:stay_in_progress:{reason}",
+                )
+                return
+
+            if workflow_decision == "change_scope":
+                rerun_budget = self._classify_success_rerun_budget(session)
+                if not rerun_budget["allowed"]:
+                    session["retrigger_requested"] = False
+                    await self._transition_issue_for_session(
+                        session,
+                        self._blocked_state_name,
+                        assignee_id=assignee_id,
+                        comment="Jax exhausted autonomous continuation attempts for this issue and moved it to Blocked for follow-up.",
+                    )
+                    return
+                session["success_rerun_count"] = rerun_budget["next_count"]
+                session["retrigger_requested"] = True
+                followup = None
+                comment = "Jax narrowed the active work on this issue into a smaller executable slice and will continue autonomously."
+                try:
+                    followup = await self._ensure_scope_followup_issue(session)
+                except Exception:
+                    logger.debug("[linear] Failed to create change-scope follow-up issue for %s", session.get("issue_identifier"), exc_info=True)
+                    comment += " Jax could not create the deferred-scope follow-up issue automatically."
+                if followup and followup.get("identifier"):
+                    comment += f" Created follow-up issue {followup['identifier']} to track the deferred remaining scope."
+                await self._transition_issue_for_session(
+                    session,
+                    self._in_progress_state_name,
+                    assignee_id=assignee_id,
+                    comment=comment,
+                )
+                await self._schedule_autonomous_rerun(
+                    event,
+                    session,
+                    rerun_kind="refit",
+                    reason="workflow_decision:change_scope",
                 )
                 return
 
@@ -1015,6 +1575,12 @@ class LinearAdapter(BasePlatformAdapter):
                     f"for retry (attempt {retry_decision['next_attempt']}/{retry_decision['max_attempts']})."
                 ),
             )
+            await self._schedule_autonomous_rerun(
+                event,
+                session,
+                rerun_kind="retry",
+                reason=retry_decision["error_class"],
+            )
             return
 
         session["retry_requested"] = False
@@ -1033,6 +1599,12 @@ class LinearAdapter(BasePlatformAdapter):
                     f"and left this issue in {self._in_progress_state_name} for an autonomous rerun "
                     f"(refit {refit_decision['next_attempt']}/{refit_decision['max_refits']})."
                 ),
+            )
+            await self._schedule_autonomous_rerun(
+                event,
+                session,
+                rerun_kind="refit",
+                reason=refit_decision["error_class"],
             )
             return
         session["retrigger_requested"] = False
@@ -1068,15 +1640,22 @@ class LinearAdapter(BasePlatformAdapter):
         app_user_id = str(session.get("app_user_id") or "")
         if issue_id and team_id and target_state:
             await self._update_issue_state(issue_id, team_id, app_user_id, target_state, assignee_id=assignee_id)
-        if comment and session.get("agent_session_id"):
+        if comment:
             try:
-                await self._create_activity(
-                    app_user_id=app_user_id,
-                    agent_session_id=str(session.get("agent_session_id") or ""),
-                    activity_type="thought",
-                    body=comment,
-                    ephemeral=False,
-                )
+                if session.get("agent_session_id"):
+                    await self._create_activity(
+                        app_user_id=app_user_id,
+                        agent_session_id=str(session.get("agent_session_id") or ""),
+                        activity_type="thought",
+                        body=comment,
+                        ephemeral=False,
+                    )
+                elif issue_id:
+                    await self._create_issue_comment(
+                        app_user_id=app_user_id,
+                        issue_id=issue_id,
+                        body=comment,
+                    )
             except Exception:
                 logger.debug("[linear] Issue transition activity failed for %s", issue_id, exc_info=True)
 

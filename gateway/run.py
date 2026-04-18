@@ -4445,6 +4445,13 @@ class GatewayRunner:
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
+            adapter = self.adapters.get(source.platform)
+            if adapter and hasattr(adapter, "apply_agent_result_metadata"):
+                try:
+                    agent_result = adapter.apply_agent_result_metadata(source.chat_id, agent_result)
+                except Exception:
+                    logger.debug("Failed to apply adapter-specific agent result metadata", exc_info=True)
+
             response = agent_result.get("final_response") or ""
 
             # Convert the agent's internal "(empty)" sentinel into a
