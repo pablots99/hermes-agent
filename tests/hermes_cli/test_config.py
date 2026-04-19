@@ -152,6 +152,25 @@ class TestSaveEnvValueSecure:
             assert env_mode == 0o600
 
 
+class TestSanitizeEnvLines:
+    def test_keeps_linear_webhook_secret_on_one_line(self):
+        lines = ["LINEAR_WEBHOOK_SECRET=lin_wh_test_secret_value\n"]
+
+        sanitized = _sanitize_env_lines(lines)
+
+        assert sanitized == ["LINEAR_WEBHOOK_SECRET=lin_wh_test_secret_value\n"]
+
+    def test_splits_concatenated_pairs_without_matching_substring_keys(self):
+        lines = ["OPENAI_API_KEY=abc123LINEAR_WEBHOOK_SECRET=lin_wh_test_secret_value\n"]
+
+        sanitized = _sanitize_env_lines(lines)
+
+        assert sanitized == [
+            "OPENAI_API_KEY=abc123\n",
+            "LINEAR_WEBHOOK_SECRET=lin_wh_test_secret_value\n",
+        ]
+
+
 class TestRemoveEnvValue:
     def test_removes_key_from_env_file(self, tmp_path):
         env_path = tmp_path / ".env"

@@ -1,4 +1,0 @@
----
-# Docker socket integration — auto-discovers containers
-- my-docker:
-    socket: /var/run/docker.sock

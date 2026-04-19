@@ -1,3 +1,0 @@
-creation_rules:
-  - path_regex: stacks/.*/\.env\.enc$
-    age: age1snttkxsjte460xkh5v6cl0u0t7umuu4q0m7za8vpgzm9yx46zdvs8sdtfz

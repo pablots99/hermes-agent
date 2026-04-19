@@ -9216,6 +9216,7 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform not in (Platform.WEBHOOK, Platform.LINEAR)
+        session_metadata = await self._resolve_structured_session_metadata(source)
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.

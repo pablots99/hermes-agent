@@ -3112,6 +3112,13 @@ def _sanitize_env_lines(lines: list) -> list:
     # Done inside the function so OPTIONAL_ENV_VARS is guaranteed to be defined.
     known_keys = set(OPTIONAL_ENV_VARS.keys()) | _EXTRA_ENV_KEYS
 
+    key_pattern = re.compile(
+        "|".join(
+            re.escape(key_name) + "="
+            for key_name in sorted(known_keys, key=len, reverse=True)
+        )
+    )
+
     sanitized: list[str] = []
     for line in lines:
         raw = line.rstrip("\r\n")
@@ -3124,13 +3131,7 @@ def _sanitize_env_lines(lines: list) -> list:
 
         # Detect concatenated KEY=VALUE pairs on one line.
         # Search for known KEY= patterns at any position in the line.
-        split_positions = []
-        for key_name in known_keys:
-            needle = key_name + "="
-            idx = stripped.find(needle)
-            while idx >= 0:
-                split_positions.append(idx)
-                idx = stripped.find(needle, idx + len(needle))
+        split_positions = [match.start() for match in key_pattern.finditer(stripped)]
 
         if len(split_positions) > 1:
             split_positions.sort()
