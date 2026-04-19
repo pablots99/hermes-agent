@@ -2125,6 +2125,82 @@ def _setup_webhooks():
     print_info("   Open config in your editor:  hermes config edit")
 
 
+def _setup_linear():
+    """Configure native Linear Agent Session integration."""
+    print_header("Linear")
+    existing = get_env_value("LINEAR_CLIENT_ID")
+    if existing:
+        print_info("Linear: already configured")
+        if not prompt_yes_no("Reconfigure Linear?", False):
+            return
+
+    print()
+    print_info("Create a Linear OAuth application, enable webhooks, and enable Agent Session events.")
+    print_info("The OAuth app should use actor=app so Jax appears as its own Linear agent identity.")
+    print_info("You will need a public HTTPS URL that Linear can reach for both the OAuth callback and webhooks.")
+    print()
+
+    client_id = prompt("Linear client ID")
+    if client_id:
+        save_env_value("LINEAR_CLIENT_ID", client_id)
+        print_success("Saved LINEAR_CLIENT_ID")
+
+    client_secret = prompt("Linear client secret", password=True)
+    if client_secret:
+        save_env_value("LINEAR_CLIENT_SECRET", client_secret)
+        print_success("Saved LINEAR_CLIENT_SECRET")
+
+    webhook_secret = prompt("Linear webhook secret", password=True)
+    if webhook_secret:
+        save_env_value("LINEAR_WEBHOOK_SECRET", webhook_secret)
+        print_success("Saved LINEAR_WEBHOOK_SECRET")
+
+    public_base_url = prompt("Public base URL (e.g. https://jaxmind.xyz)")
+    if public_base_url:
+        save_env_value("LINEAR_PUBLIC_BASE_URL", public_base_url.rstrip("/"))
+        print_success("Saved LINEAR_PUBLIC_BASE_URL")
+
+    port = prompt("Linear listener port (default 8646)")
+    if port:
+        try:
+            save_env_value("LINEAR_PORT", str(int(port)))
+            print_success(f"Linear port set to {port}")
+        except ValueError:
+            print_warning("Invalid port number, using default 8646")
+
+    max_concurrent = prompt("Max concurrent Linear sessions (default 3)")
+    if max_concurrent:
+        try:
+            save_env_value("LINEAR_MAX_CONCURRENT_SESSIONS", str(max(1, int(max_concurrent))))
+            print_success(f"Linear max concurrent sessions set to {max(1, int(max_concurrent))}")
+        except ValueError:
+            print_warning("Invalid max concurrency, using default 3")
+
+    default_execution_mode = prompt("Default execution mode (autonomous_with_testing/human_gate/autonomous_dev/manual_only)")
+    if default_execution_mode:
+        save_env_value("LINEAR_DEFAULT_EXECUTION_MODE", default_execution_mode.strip().lower())
+        print_success(f"Linear default execution mode set to {default_execution_mode.strip().lower()}")
+
+    supported_task_types = prompt("Supported task types for current Jax executor (comma-separated, e.g. engineering,ops,research)")
+    if supported_task_types:
+        save_env_value("LINEAR_SUPPORTED_TASK_TYPES", supported_task_types)
+        print_success("Saved LINEAR_SUPPORTED_TASK_TYPES")
+
+    project_execution_modes = prompt("Project execution modes JSON (optional, e.g. {\"Jax Control Plane\":\"autonomous_with_testing\"})")
+    if project_execution_modes:
+        save_env_value("LINEAR_PROJECT_EXECUTION_MODES", project_execution_modes)
+        print_success("Saved LINEAR_PROJECT_EXECUTION_MODES")
+
+    save_env_value("LINEAR_ENABLED", "true")
+    print()
+    print_success("Linear integration enabled! Next steps:")
+    print_info("   1. Start or restart the gateway")
+    print_info("   2. Open: <public-base-url>/linear/oauth/authorize")
+    print_info("   3. Complete the Linear install flow as an admin")
+    print_info("   4. In the Linear app settings, point Agent Session webhooks to:")
+    print_info("      <public-base-url>/linear/webhook")
+
+
 # Platform registry for the gateway checklist
 _GATEWAY_PLATFORMS = [
     ("Telegram", "TELEGRAM_BOT_TOKEN", _setup_telegram),
@@ -2144,6 +2220,7 @@ _GATEWAY_PLATFORMS = [
     ("BlueBubbles (iMessage)", "BLUEBUBBLES_SERVER_URL", _setup_bluebubbles),
     ("QQ Bot", "QQ_APP_ID", _setup_qqbot),
     ("Webhooks (GitHub, GitLab, etc.)", "WEBHOOK_ENABLED", _setup_webhooks),
+    ("Linear Agent Sessions", "LINEAR_CLIENT_ID", _setup_linear),
 ]
 
 
@@ -2196,6 +2273,7 @@ def setup_gateway(config: dict):
         or get_env_value("BLUEBUBBLES_SERVER_URL")
         or get_env_value("QQ_APP_ID")
         or get_env_value("WEBHOOK_ENABLED")
+        or get_env_value("LINEAR_CLIENT_ID")
     )
     if any_messaging:
         print()

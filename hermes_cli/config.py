@@ -1676,6 +1676,97 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "messaging",
     },
+    "LINEAR_ENABLED": {
+        "description": "Enable the native Linear Agent Session platform adapter.",
+        "prompt": "Enable Linear agent platform (true/false)",
+        "url": "https://linear.app/settings/api/applications",
+        "password": False,
+        "category": "messaging",
+    },
+    "LINEAR_CLIENT_ID": {
+        "description": "Linear OAuth application client ID.",
+        "prompt": "Linear client ID",
+        "url": "https://linear.app/settings/api/applications",
+        "password": False,
+        "category": "messaging",
+    },
+    "LINEAR_CLIENT_SECRET": {
+        "description": "Linear OAuth application client secret.",
+        "prompt": "Linear client secret",
+        "url": "https://linear.app/settings/api/applications",
+        "password": True,
+        "category": "messaging",
+    },
+    "LINEAR_WEBHOOK_SECRET": {
+        "description": "Linear webhook signing secret used to verify Agent Session webhooks.",
+        "prompt": "Linear webhook secret",
+        "url": "https://linear.app/settings/api/applications",
+        "password": True,
+        "category": "messaging",
+    },
+    "LINEAR_PUBLIC_BASE_URL": {
+        "description": "Public base URL Linear can reach for OAuth callbacks and webhooks (e.g. https://jaxmind.xyz).",
+        "prompt": "Linear public base URL",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+    },
+    "LINEAR_HOST": {
+        "description": "Host/bind address for the Linear HTTP server (default: 127.0.0.1).",
+        "prompt": "Linear host",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "LINEAR_PORT": {
+        "description": "Port for the Linear HTTP server (default: 8646).",
+        "prompt": "Linear port",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "LINEAR_SCOPES": {
+        "description": "Comma-separated Linear OAuth scopes override. Defaults to read,write,app:mentionable,app:assignable.",
+        "prompt": "Linear OAuth scopes",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "LINEAR_MAX_CONCURRENT_SESSIONS": {
+        "description": "Maximum number of Linear Agent Sessions Jax should work on at once before queueing new ones (default: 3).",
+        "prompt": "Linear max concurrent sessions",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "LINEAR_DEFAULT_EXECUTION_MODE": {
+        "description": "Default execution mode for Linear issues (autonomous_dev, autonomous_with_testing, human_gate, manual_only).",
+        "prompt": "Linear default execution mode",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "LINEAR_PROJECT_EXECUTION_MODES": {
+        "description": "JSON object mapping Linear project names/IDs to execution modes.",
+        "prompt": "Linear project execution modes JSON",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "LINEAR_SUPPORTED_TASK_TYPES": {
+        "description": "Comma-separated task types current Jax executor can handle automatically.",
+        "prompt": "Linear supported task types",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
 
     # ── Agent settings ──
     # NOTE: MESSAGING_CWD was removed here — use terminal.cwd in config.yaml
@@ -3021,6 +3112,13 @@ def _sanitize_env_lines(lines: list) -> list:
     # Done inside the function so OPTIONAL_ENV_VARS is guaranteed to be defined.
     known_keys = set(OPTIONAL_ENV_VARS.keys()) | _EXTRA_ENV_KEYS
 
+    key_pattern = re.compile(
+        "|".join(
+            re.escape(key_name) + "="
+            for key_name in sorted(known_keys, key=len, reverse=True)
+        )
+    )
+
     sanitized: list[str] = []
     for line in lines:
         raw = line.rstrip("\r\n")
@@ -3033,13 +3131,7 @@ def _sanitize_env_lines(lines: list) -> list:
 
         # Detect concatenated KEY=VALUE pairs on one line.
         # Search for known KEY= patterns at any position in the line.
-        split_positions = []
-        for key_name in known_keys:
-            needle = key_name + "="
-            idx = stripped.find(needle)
-            while idx >= 0:
-                split_positions.append(idx)
-                idx = stripped.find(needle, idx + len(needle))
+        split_positions = [match.start() for match in key_pattern.finditer(stripped)]
 
         if len(split_positions) > 1:
             split_positions.sort()

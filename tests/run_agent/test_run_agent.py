@@ -15,6 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from gateway.session_context import clear_session_vars, set_session_vars
+
 import pytest
 
 import run_agent
@@ -182,6 +184,37 @@ class TestProviderModelNormalization:
             )
 
         assert agent.model == "anthropic/claude-sonnet-4.6"
+
+
+def test_save_session_log_includes_structured_session_metadata(agent, tmp_path):
+    agent.session_log_file = tmp_path / "session_test.json"
+    agent._session_messages = [
+        {"role": "user", "content": "Please investigate PAB-143."},
+        {"role": "assistant", "content": "On it."},
+    ]
+
+    tokens = set_session_vars(
+        platform="linear",
+        chat_id="linear:session-123",
+        session_key="linear:session-123",
+    )
+    try:
+        agent.session_metadata = {
+            "context_type": "linear_agent_session",
+            "issue_identifier": "PAB-143",
+            "project_key": "Jax_Control_Plane",
+            "project_name": "Jax Control Plane",
+            "obsidian_path": "/lab/obsidian_vault/Projects/Jax Control Plane/",
+            "repo_url": "https://github.com/pablots99/jax-control-plane",
+        }
+        agent._save_session_log()
+    finally:
+        clear_session_vars(tokens)
+
+    payload = json.loads(agent.session_log_file.read_text(encoding="utf-8"))
+    assert payload["session_metadata"]["issue_identifier"] == "PAB-143"
+    assert payload["session_metadata"]["project_key"] == "Jax_Control_Plane"
+    assert payload["session_metadata"]["repo_url"] == "https://github.com/pablots99/jax-control-plane"
 
 
 # ---------------------------------------------------------------------------

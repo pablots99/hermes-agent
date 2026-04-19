@@ -860,6 +860,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
         credential_pool = None
+        cron_session_metadata = {
+            "context_type": "cron_job",
+            "job_id": job_id,
+            "job_name": job_name,
+            "deliver": job.get("deliver"),
+            "origin": job.get("origin"),
+            "schedule": job.get("schedule"),
+            "script": job.get("script"),
+            "skills": list(job.get("skills") or []),
+        }
         runtime_provider = str(turn_route["runtime"].get("provider") or "").strip().lower()
         if runtime_provider:
             try:
@@ -899,6 +909,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             skip_memory=True,  # Cron system prompts would corrupt user representations
             platform="cron",
             session_id=_cron_session_id,
+            session_metadata=cron_session_metadata,
             session_db=_session_db,
         )
         

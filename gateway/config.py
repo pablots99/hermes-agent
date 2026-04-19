@@ -61,6 +61,7 @@ class Platform(Enum):
     DINGTALK = "dingtalk"
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
+    LINEAR = "linear"
     FEISHU = "feishu"
     WECOM = "wecom"
     WECOM_CALLBACK = "wecom_callback"
@@ -112,7 +113,7 @@ class SessionResetPolicy:
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
     notify: bool = True  # Send a notification to the user when auto-reset occurs
-    notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
+    notify_exclude_platforms: tuple = ("api_server", "webhook", "linear")  # Platforms that don't get reset notifications
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -136,7 +137,7 @@ class SessionResetPolicy:
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
             notify=notify if notify is not None else True,
-            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
+            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook", "linear"),
         )
 
 
@@ -296,6 +297,13 @@ class GatewayConfig:
                 connected.append(platform)
             # Webhook uses enabled flag only (secrets are per-route)
             elif platform == Platform.WEBHOOK:
+                connected.append(platform)
+            # Linear uses OAuth app credentials + webhook secret in extra config
+            elif platform == Platform.LINEAR and (
+                config.extra.get("client_id")
+                and config.extra.get("client_secret")
+                and config.extra.get("webhook_secret")
+            ):
                 connected.append(platform)
             # Feishu uses extra dict for app credentials
             elif platform == Platform.FEISHU and config.extra.get("app_id"):
@@ -1062,6 +1070,57 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if webhook_secret:
             config.platforms[Platform.WEBHOOK].extra["secret"] = webhook_secret
 
+    # Linear agent platform
+    linear_enabled = os.getenv("LINEAR_ENABLED", "").lower() in ("true", "1", "yes")
+    linear_client_id = os.getenv("LINEAR_CLIENT_ID", "")
+    linear_client_secret = os.getenv("LINEAR_CLIENT_SECRET", "")
+    linear_webhook_secret = os.getenv("LINEAR_WEBHOOK_SECRET", "")
+    linear_public_base_url = os.getenv("LINEAR_PUBLIC_BASE_URL", "")
+    linear_host = os.getenv("LINEAR_HOST", "")
+    linear_port = os.getenv("LINEAR_PORT", "")
+    linear_scopes = os.getenv("LINEAR_SCOPES", "")
+    linear_max_concurrent_sessions = os.getenv("LINEAR_MAX_CONCURRENT_SESSIONS", "")
+    linear_default_execution_mode = os.getenv("LINEAR_DEFAULT_EXECUTION_MODE", "")
+    linear_project_execution_modes = os.getenv("LINEAR_PROJECT_EXECUTION_MODES", "")
+    linear_supported_task_types = os.getenv("LINEAR_SUPPORTED_TASK_TYPES", "")
+    if linear_enabled or linear_client_id or linear_client_secret or linear_webhook_secret:
+        if Platform.LINEAR not in config.platforms:
+            config.platforms[Platform.LINEAR] = PlatformConfig()
+        config.platforms[Platform.LINEAR].enabled = True
+        linear_extra = config.platforms[Platform.LINEAR].extra
+        if linear_client_id:
+            linear_extra["client_id"] = linear_client_id
+        if linear_client_secret:
+            linear_extra["client_secret"] = linear_client_secret
+        if linear_webhook_secret:
+            linear_extra["webhook_secret"] = linear_webhook_secret
+        if linear_public_base_url:
+            linear_extra["public_base_url"] = linear_public_base_url.rstrip("/")
+        if linear_host:
+            linear_extra["host"] = linear_host
+        if linear_port:
+            try:
+                linear_extra["port"] = int(linear_port)
+            except ValueError:
+                pass
+        if linear_scopes:
+            linear_extra["scopes"] = [scope.strip() for scope in linear_scopes.split(",") if scope.strip()]
+        if linear_max_concurrent_sessions:
+            try:
+                linear_extra["max_concurrent_sessions"] = max(1, int(linear_max_concurrent_sessions))
+            except ValueError:
+                pass
+        if linear_default_execution_mode:
+            linear_extra["default_execution_mode"] = linear_default_execution_mode.strip().lower()
+        if linear_project_execution_modes:
+            try:
+                loaded_modes = json.loads(linear_project_execution_modes)
+                if isinstance(loaded_modes, dict):
+                    linear_extra["project_execution_modes"] = loaded_modes
+            except Exception:
+                pass
+        if linear_supported_task_types:
+            linear_extra["supported_task_types"] = [task_type.strip() for task_type in linear_supported_task_types.split(",") if task_type.strip()]
     # DingTalk
     dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID")
     dingtalk_client_secret = os.getenv("DINGTALK_CLIENT_SECRET")

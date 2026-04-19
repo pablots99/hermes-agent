@@ -664,6 +664,7 @@ class AIAgent:
         platform: str = None,
         user_id: str = None,
         gateway_session_key: str = None,
+        session_metadata: Dict[str, Any] = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
@@ -733,6 +734,7 @@ class AIAgent:
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+        self.session_metadata = dict(session_metadata) if isinstance(session_metadata, dict) else {}
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1274,6 +1276,7 @@ class AIAgent:
                         "max_iterations": self.max_iterations,
                         "reasoning_config": reasoning_config,
                         "max_tokens": max_tokens,
+                        "session_metadata": self.session_metadata or None,
                     },
                     user_id=None,
                     parent_session_id=self._parent_session_id,
@@ -3230,6 +3233,7 @@ class AIAgent:
                 "system_prompt": self._cached_system_prompt or "",
                 "tools": self.tools or [],
                 "message_count": len(cleaned),
+                "session_metadata": dict(self.session_metadata) if self.session_metadata else {},
                 "messages": cleaned,
             }
 
