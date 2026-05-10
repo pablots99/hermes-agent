@@ -7928,6 +7928,8 @@ class HermesCLI:
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._show_usage()
+        elif canonical == "codex":
+            self._show_codex_usage(cmd_original)
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "copy":
@@ -9368,6 +9370,30 @@ class HermesCLI:
             db.close()
         except Exception as e:
             print(f"  Error generating insights: {e}")
+
+    def _show_codex_usage(self, command: str = "/codex"):
+        """Show rolling Codex usage windows from session history."""
+        parts = command.split()
+        source = None
+        i = 1
+        while i < len(parts):
+            if parts[i] == "--source" and i + 1 < len(parts):
+                source = parts[i + 1]
+                i += 2
+            else:
+                i += 1
+
+        try:
+            from hermes_state import SessionDB
+            from agent.codex_usage import CodexUsageTracker
+
+            db = SessionDB()
+            tracker = CodexUsageTracker(db)
+            report = tracker.generate(source=source)
+            print(tracker.format_terminal(report))
+            db.close()
+        except Exception as e:
+            print(f"  Error generating Codex usage: {e}")
 
     def _check_config_mcp_changes(self) -> None:
         """Detect mcp_servers changes in config.yaml and auto-reload MCP connections.

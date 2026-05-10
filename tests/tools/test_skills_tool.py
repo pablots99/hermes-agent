@@ -411,6 +411,14 @@ class TestSkillView:
         assert "Current date: !`printf SHOULD_NOT_RUN`" in result["content"]
         assert "Current date: SHOULD_NOT_RUN" not in result["content"]
 
+    def test_view_accepts_category_colon_alias_for_categorized_skill(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "operator-visible-qa-flow", category="software-development")
+            raw = skill_view("software-development:operator-visible-qa-flow")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "operator-visible-qa-flow"
+
     def test_view_nonexistent_skill(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "other-skill")

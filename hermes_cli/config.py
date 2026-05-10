@@ -2733,8 +2733,16 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "LINEAR_SCOPES": {
-        "description": "Comma-separated Linear OAuth scopes override. Defaults to read,comments:create,app:mentionable,app:assignable.",
+        "description": "Comma-separated Linear OAuth scopes override. Defaults to read,write,app:mentionable,app:assignable.",
         "prompt": "Linear OAuth scopes",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "LINEAR_MAX_CONCURRENT_SESSIONS": {
+        "description": "Maximum number of Linear Agent Sessions Jax should work on at once before queueing new ones (default: 3).",
+        "prompt": "Linear max concurrent sessions",
         "url": None,
         "password": False,
         "category": "messaging",
