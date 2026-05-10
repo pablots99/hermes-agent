@@ -151,6 +151,26 @@ def test_aiagent_reuses_existing_errors_log_handler():
             root_logger.addHandler(handler)
 
 
+def test_aiagent_accepts_session_metadata():
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("web_search"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-k...7890",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_metadata={"issue_id": "H-123", "project_name": "Hermes"},
+        )
+
+    assert agent.session_metadata == {"issue_id": "H-123", "project_name": "Hermes"}
+
+
 class TestProviderModelNormalization:
     def test_aiagent_strips_matching_native_provider_prefix(self):
         with (

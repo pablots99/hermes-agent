@@ -2504,6 +2504,14 @@ def _setup_linear():
         except ValueError:
             print_warning("Invalid port number, using default 8646")
 
+    max_concurrent = prompt("Max concurrent Linear sessions (default 3)")
+    if max_concurrent:
+        try:
+            save_env_value("LINEAR_MAX_CONCURRENT_SESSIONS", str(max(1, int(max_concurrent))))
+            print_success(f"Linear max concurrent sessions set to {max(1, int(max_concurrent))}")
+        except ValueError:
+            print_warning("Invalid max concurrency, using default 3")
+
     save_env_value("LINEAR_ENABLED", "true")
     print()
     print_success("Linear integration enabled! Next steps:")

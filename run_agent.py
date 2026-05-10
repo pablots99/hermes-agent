@@ -1199,6 +1199,8 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        persist_session: bool = True,
+        session_metadata: Dict[str, Any] = None,
     ):
         """
         Initialize the AI Agent.
@@ -1277,6 +1279,8 @@ class AIAgent:
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
+        self.persist_session = persist_session
+        self.session_metadata = dict(session_metadata or {})
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
