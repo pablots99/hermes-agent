@@ -217,6 +217,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("credits", "Show Nous credit balance and top up", "Info"),
     CommandDef("billing", "Manage Nous terminal billing — buy credits, auto-reload, limits", "Info",
                cli_only=True),
+    CommandDef("codex", "Show rolling Codex usage windows (5h / 7d / 30d)", "Info",
+               args_hint="[--source platform]"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
