@@ -508,6 +508,17 @@ class TestCLI:
         cur = [b for b in data if b["is_current"]][0]
         assert cur["slug"] == "myproj"
 
+    def test_boards_list_ignores_inherited_board_pin_and_uses_persisted_current(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "myproj", "--switch"], env_extra=env).returncode == 0
+
+        inherited_pin_env = {**env, "HERMES_KANBAN_BOARD": "default"}
+        res = _cli(["boards", "list", "--json"], env_extra=inherited_pin_env)
+        assert res.returncode == 0, res.stderr
+        data = json.loads(res.stdout)
+        cur = [b for b in data if b["is_current"]][0]
+        assert cur["slug"] == "myproj"
+
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
         assert _cli(["boards", "create", "projA"], env_extra=env).returncode == 0

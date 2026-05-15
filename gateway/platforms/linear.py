@@ -48,6 +48,7 @@ from gateway.platforms.base import (
 )
 from gateway.session import build_session_key
 from hermes_constants import get_hermes_home
+from hermes_cli import kanban_db
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ SUPPORTED_EXECUTION_MODES = {
     "autonomous_with_testing",
     "human_gate",
     "manual_only",
+    "kanban_orchestrated",
 }
 DEFAULT_SUPPORTED_TASK_TYPES = ["engineering", "ops", "research", "product", "admin"]
 DEFAULT_TASK_TYPE = "engineering"
@@ -92,6 +94,8 @@ VALID_WORKFLOW_DECISIONS = {
     "change_scope",
     "needs_human_review",
 }
+
+KANBAN_LINK_BLOCK_HEADER = "Linear ↔ Hermes Kanban"
 
 
 def check_linear_requirements() -> bool:
@@ -130,6 +134,15 @@ class LinearAdapter(BasePlatformAdapter):
             for key, value in raw_project_modes.items()
             if str(key).strip()
         } if isinstance(raw_project_modes, dict) else {}
+        raw_project_kanban_boards = extra.get("project_kanban_boards") or {}
+        self._project_kanban_boards = {
+            str(key).strip(): str(value).strip()
+            for key, value in raw_project_kanban_boards.items()
+            if str(key).strip() and str(value).strip()
+        } if isinstance(raw_project_kanban_boards, dict) else {}
+        self._kanban_auto_create_boards = bool(extra.get("kanban_auto_create_boards", True))
+        self._kanban_post_start_comment = bool(extra.get("kanban_post_start_comment", True))
+        self._kanban_include_link_block = bool(extra.get("kanban_include_link_block", True))
         raw_supported_task_types = extra.get("supported_task_types") or DEFAULT_SUPPORTED_TASK_TYPES
         if isinstance(raw_supported_task_types, str):
             self._supported_task_types = {
@@ -233,6 +246,126 @@ class LinearAdapter(BasePlatformAdapter):
         return normalized or None
 
     @staticmethod
+    def _normalize_kanban_board_slug(value: Any) -> Optional[str]:
+        slug = re.sub(r"[^a-z0-9_-]+", "-", str(value or "").strip().lower())
+        slug = re.sub(r"-+", "-", slug).strip("-_")
+        return slug or None
+
+    @classmethod
+    def _derive_repo_board_slug(cls, repo_url: Any) -> Optional[str]:
+        repo = str(repo_url or "").strip().rstrip("/")
+        if not repo:
+            return None
+        if ":" in repo and "/" in repo and not repo.startswith(("http://", "https://")):
+            repo = repo.split(":", 1)[-1]
+        repo_name = repo.rsplit("/", 1)[-1]
+        if repo_name.endswith(".git"):
+            repo_name = repo_name[:-4]
+        return cls._normalize_kanban_board_slug(repo_name)
+
+    def _derive_kanban_board(self, issue: Dict[str, Any], project_metadata: Optional[Dict[str, Any]] = None) -> tuple[Optional[str], Optional[str]]:
+        project = issue.get("project") or {}
+        project_name = str((project_metadata or {}).get("project_name") or project.get("name") or "").strip()
+        project_id = str(project.get("id") or "").strip()
+        if project_id and project_id in self._project_kanban_boards:
+            board = self._normalize_kanban_board_slug(self._project_kanban_boards[project_id])
+            if board:
+                return board, "project_mapping"
+        if project_name and project_name in self._project_kanban_boards:
+            board = self._normalize_kanban_board_slug(self._project_kanban_boards[project_name])
+            if board:
+                return board, "project_mapping"
+        repo_board = self._derive_repo_board_slug((project_metadata or {}).get("repo_url"))
+        if repo_board:
+            return repo_board, "repo"
+        project_board = self._normalize_kanban_board_slug(project_name)
+        if project_board:
+            return project_board, "project_name"
+        return None, None
+
+    def _build_kanban_guidance_block(self, session: Dict[str, Any]) -> str:
+        board_slug = str(session.get("kanban_board_slug") or "").strip() or "(derive-or-create a repo/domain board)"
+        link_block = self._build_kanban_link_block(session, include_commands=False)
+        return (
+            "Kanban orchestration policy:\n"
+            "- Linear is the human-facing control plane. Hermes Kanban is the execution plane.\n"
+            f"- Hermes Kanban board: {board_slug}\n"
+            "- Do execution work through the Kanban board: break the issue into runnable tasks, use dependencies, and keep tactical execution there instead of turning Linear into the worker queue.\n"
+            "- Do not mirror every Kanban task back into Linear. Sync only milestone-level updates: started, blocked, needs approval, ready for testing, done.\n"
+            "- Keep Linear titles and comments outcome-oriented. Keep Kanban tasks tactical and execution-oriented.\n\n"
+            f"{link_block}\n\n"
+        )
+
+    def _ensure_kanban_board_ready(self, session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if str(session.get("execution_mode") or "") != "kanban_orchestrated":
+            return None
+        board_slug = self._normalize_kanban_board_slug(session.get("kanban_board_slug"))
+        if not board_slug:
+            return None
+        project_name = str(session.get("project_name") or "").strip()
+        meta: Optional[Dict[str, Any]] = None
+        already_exists = kanban_db.board_exists(board_slug)
+        session["kanban_board_exists"] = already_exists
+        session["kanban_board_auto_created"] = False
+        if already_exists:
+            try:
+                meta = kanban_db.read_board_metadata(board_slug)
+            except Exception:
+                logger.debug("[linear] Failed reading existing kanban board metadata for %s", board_slug, exc_info=True)
+            return meta
+        if not self._kanban_auto_create_boards:
+            return None
+        try:
+            meta = kanban_db.create_board(
+                board_slug,
+                name=project_name or None,
+                description=(
+                    f"Auto-created by Linear kanban orchestration for {project_name}."
+                    if project_name else
+                    "Auto-created by Linear kanban orchestration."
+                ),
+            )
+            session["kanban_board_exists"] = True
+            session["kanban_board_auto_created"] = True
+            return meta
+        except Exception:
+            logger.warning("[linear] Failed to auto-create kanban board %s", board_slug, exc_info=True)
+            return None
+
+    def _build_kanban_link_block(self, session: Dict[str, Any], *, include_commands: bool = True) -> str:
+        if not self._kanban_include_link_block:
+            return ""
+        issue_identifier = str(session.get("issue_identifier") or session.get("issue_id") or "").strip() or "(unknown issue)"
+        issue_title = str(session.get("issue_title") or "").strip()
+        board_slug = str(session.get("kanban_board_slug") or "").strip() or "(pending board resolution)"
+        board_source = str(session.get("kanban_board_source") or "").strip() or "derived"
+        state = "auto-created" if session.get("kanban_board_auto_created") else "existing"
+        issue_line = issue_identifier if not issue_title else f"{issue_identifier} — {issue_title}"
+        lines = [
+            KANBAN_LINK_BLOCK_HEADER,
+            f"- Linear issue: {issue_line}",
+            f"- Kanban board: {board_slug} ({state}, source: {board_source})",
+            "- Policy: Linear tracks milestones; Hermes Kanban owns tactical execution.",
+        ]
+        if include_commands and board_slug and not board_slug.startswith("("):
+            lines.append(f"- Local follow-up: `hermes kanban boards switch {board_slug}`")
+        return "\n".join(lines)
+
+    def _build_kanban_start_comment(self, session: Dict[str, Any]) -> Optional[str]:
+        if str(session.get("execution_mode") or "") != "kanban_orchestrated":
+            return None
+        board_slug = str(session.get("kanban_board_slug") or "").strip()
+        if not board_slug:
+            return None
+        opening = f"Jax is executing this issue through Hermes Kanban on board `{board_slug}`."
+        if session.get("kanban_board_auto_created"):
+            opening += " I auto-created the board for this project."
+        link_block = self._build_kanban_link_block(session)
+        if link_block:
+            return f"{opening}\n\n{link_block}"
+        return opening
+
+    @staticmethod
     def _extract_project_registry_metadata(prompt_context: Any) -> Dict[str, Any]:
         text = str(prompt_context or "")
         if not text:
@@ -284,6 +417,7 @@ class LinearAdapter(BasePlatformAdapter):
         creator = agent_session.get("creator") or {}
         assignee = issue.get("assignee") or {}
         project_metadata = self._extract_project_registry_metadata(payload.get("promptContext"))
+        kanban_board_slug, kanban_board_source = self._derive_kanban_board(issue, project_metadata)
         session = {
             "context_type": "linear_agent_session",
             "agent_session_id": str(agent_session.get("id") or ""),
@@ -303,10 +437,13 @@ class LinearAdapter(BasePlatformAdapter):
             "creator_name": str(creator.get("name") or ""),
             "current_assignee_id": str(assignee.get("id") or issue.get("assigneeId") or "") or None,
             "current_assignee_name": str(assignee.get("name") or issue.get("assignee") or "") or None,
+            "kanban_board_slug": kanban_board_slug,
+            "kanban_board_source": kanban_board_source,
             "updated_at": time.time(),
             **project_metadata,
             **policy,
         }
+        self._ensure_kanban_board_ready(session)
         self._session_info[chat_id] = session
         return session
 
@@ -742,6 +879,7 @@ class LinearAdapter(BasePlatformAdapter):
         if execution_mode != "human_gate":
             allowed_decisions.insert(1, "ready_for_testing")
         example_decision = "done" if execution_mode != "human_gate" else "needs_human_review"
+        orchestration_guidance = self._build_kanban_guidance_block(session) if execution_mode == "kanban_orchestrated" else ""
         return (
             "A delegated Linear issue is already in progress and must continue autonomously now.\n\n"
             f"Issue: {issue_identifier} {issue_title}\n"
@@ -750,6 +888,7 @@ class LinearAdapter(BasePlatformAdapter):
             f"Execution mode: {execution_mode}\n\n"
             "Description:\n"
             f"{issue_description or '(no description)'}\n\n"
+            f"{orchestration_guidance}"
             "Testing semantics are strict: choose `ready_for_testing` only when actual testing is still pending. "
             "If manual testing is required, your visible response must include a concrete QA handoff covering what changed, where to test, exact steps, expected result, what you already validated, and remaining risk. "
             "If you already validated the slice sufficiently and no real testing action remains, choose `done` instead of `ready_for_testing`.\n\n"
@@ -767,6 +906,7 @@ class LinearAdapter(BasePlatformAdapter):
         assignee = issue.get("assignee") or {}
         creator = issue.get("creator") or {}
         policy = self._build_execution_policy(issue)
+        kanban_board_slug, kanban_board_source = self._derive_kanban_board(issue)
         session = {
             "context_type": "linear_issue_reconcile",
             "app_user_id": str(app_user_id or ""),
@@ -784,9 +924,12 @@ class LinearAdapter(BasePlatformAdapter):
             "creator_name": str(creator.get("name") or ""),
             "current_assignee_id": str(assignee.get("id") or issue.get("assigneeId") or "") or None,
             "current_assignee_name": str(assignee.get("name") or issue.get("assignee") or "") or None,
+            "kanban_board_slug": kanban_board_slug,
+            "kanban_board_source": kanban_board_source,
             "updated_at": time.time(),
             **policy,
         }
+        self._ensure_kanban_board_ready(session)
         self._session_info[chat_id] = session
         return session
 
@@ -1084,6 +1227,15 @@ class LinearAdapter(BasePlatformAdapter):
                 )
                 await self._maybe_send_queue_activity(event.source.chat_id, block_message)
                 return
+            if self._kanban_post_start_comment and not session.get("kanban_start_comment_posted"):
+                start_comment = self._build_kanban_start_comment(session)
+                if start_comment:
+                    await self._transition_issue_for_session(
+                        session,
+                        self._in_progress_state_name,
+                        comment=start_comment,
+                    )
+                    session["kanban_start_comment_posted"] = True
 
         queue_notice_needed = False
 
@@ -1152,6 +1304,7 @@ class LinearAdapter(BasePlatformAdapter):
         if execution_mode != "human_gate":
             allowed_decisions.insert(1, "ready_for_testing")
         example_decision = "done" if execution_mode != "human_gate" else "needs_human_review"
+        orchestration_guidance = self._build_kanban_guidance_block(session) if execution_mode == "kanban_orchestrated" else ""
 
         if action == "created":
             prompt_context = payload.get("promptContext") or ""
@@ -1164,6 +1317,7 @@ class LinearAdapter(BasePlatformAdapter):
                 f"Guidance:\n```json\n{guidance_text}\n```\n\n"
                 "Use the following Linear-provided promptContext as the authoritative context:\n\n"
                 f"```text\n{prompt_context[:12000]}\n```\n\n"
+                f"{orchestration_guidance}"
                 "Testing semantics are strict: choose `ready_for_testing` only when actual testing is still pending. If manual testing is required, your visible response must include a concrete QA handoff covering what changed, where to test, exact steps, expected result, what you already validated, and remaining risk. If you already validated the slice sufficiently and no real testing action remains, choose `done` instead of `ready_for_testing`.\n\n"
                 "At the end of your visible response, append a machine-readable workflow block so Jax can route the issue correctly.\n"
                 "Format exactly like:\n"
@@ -1183,6 +1337,7 @@ class LinearAdapter(BasePlatformAdapter):
             f"Issue: {issue_identifier} {issue_title}\n"
             f"Signal: {signal or '(none)'}\n"
             f"User message:\n\n{body}\n\n"
+            f"{orchestration_guidance}"
             "Testing semantics are strict: choose `ready_for_testing` only when actual testing is still pending. If manual testing is required, your visible response must include a concrete QA handoff covering what changed, where to test, exact steps, expected result, what you already validated, and remaining risk. If you already validated the slice sufficiently and no real testing action remains, choose `done` instead of `ready_for_testing`.\n\n"
             "At the end of your visible response, append a machine-readable workflow block so Jax can route the issue correctly.\n"
             "Format exactly like:\n"

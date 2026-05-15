@@ -1655,6 +1655,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     linear_max_concurrent_sessions = os.getenv("LINEAR_MAX_CONCURRENT_SESSIONS", "")
     linear_default_execution_mode = os.getenv("LINEAR_DEFAULT_EXECUTION_MODE", "")
     linear_project_execution_modes = os.getenv("LINEAR_PROJECT_EXECUTION_MODES", "")
+    linear_project_kanban_boards = os.getenv("LINEAR_PROJECT_KANBAN_BOARDS", "")
+    linear_kanban_auto_create_boards = os.getenv("LINEAR_KANBAN_AUTO_CREATE_BOARDS", "")
+    linear_kanban_post_start_comment = os.getenv("LINEAR_KANBAN_POST_START_COMMENT", "")
+    linear_kanban_include_link_block = os.getenv("LINEAR_KANBAN_INCLUDE_LINK_BLOCK", "")
     linear_supported_task_types = os.getenv("LINEAR_SUPPORTED_TASK_TYPES", "")
     if linear_enabled or linear_client_id or linear_client_secret or linear_webhook_secret:
         if Platform.LINEAR not in config.platforms:
@@ -1692,6 +1696,19 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                     linear_extra["project_execution_modes"] = loaded_modes
             except Exception:
                 pass
+        if linear_project_kanban_boards:
+            try:
+                loaded_boards = json.loads(linear_project_kanban_boards)
+                if isinstance(loaded_boards, dict):
+                    linear_extra["project_kanban_boards"] = loaded_boards
+            except Exception:
+                pass
+        if linear_kanban_auto_create_boards:
+            linear_extra["kanban_auto_create_boards"] = linear_kanban_auto_create_boards.lower() in ("true", "1", "yes")
+        if linear_kanban_post_start_comment:
+            linear_extra["kanban_post_start_comment"] = linear_kanban_post_start_comment.lower() in ("true", "1", "yes")
+        if linear_kanban_include_link_block:
+            linear_extra["kanban_include_link_block"] = linear_kanban_include_link_block.lower() in ("true", "1", "yes")
         if linear_supported_task_types:
             linear_extra["supported_task_types"] = [task_type.strip() for task_type in linear_supported_task_types.split(",") if task_type.strip()]
 

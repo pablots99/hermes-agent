@@ -44,6 +44,10 @@ def test_apply_env_overrides_configures_linear(monkeypatch):
     monkeypatch.setenv("LINEAR_MAX_CONCURRENT_SESSIONS", "5")
     monkeypatch.setenv("LINEAR_DEFAULT_EXECUTION_MODE", "human_gate")
     monkeypatch.setenv("LINEAR_PROJECT_EXECUTION_MODES", '{"Jax Control Plane":"autonomous_with_testing"}')
+    monkeypatch.setenv("LINEAR_PROJECT_KANBAN_BOARDS", '{"Jax Control Plane":"jax-control-plane"}')
+    monkeypatch.setenv("LINEAR_KANBAN_AUTO_CREATE_BOARDS", "false")
+    monkeypatch.setenv("LINEAR_KANBAN_POST_START_COMMENT", "false")
+    monkeypatch.setenv("LINEAR_KANBAN_INCLUDE_LINK_BLOCK", "false")
     monkeypatch.setenv("LINEAR_SUPPORTED_TASK_TYPES", "engineering,ops,research")
 
     _apply_env_overrides(config)
@@ -61,6 +65,10 @@ def test_apply_env_overrides_configures_linear(monkeypatch):
     assert linear.extra["max_concurrent_sessions"] == 5
     assert linear.extra["default_execution_mode"] == "human_gate"
     assert linear.extra["project_execution_modes"] == {"Jax Control Plane": "autonomous_with_testing"}
+    assert linear.extra["project_kanban_boards"] == {"Jax Control Plane": "jax-control-plane"}
+    assert linear.extra["kanban_auto_create_boards"] is False
+    assert linear.extra["kanban_post_start_comment"] is False
+    assert linear.extra["kanban_include_link_block"] is False
     assert linear.extra["supported_task_types"] == ["engineering", "ops", "research"]
 
 
@@ -187,6 +195,203 @@ def test_build_prompt_for_created_event_uses_prompt_context_and_flow_metadata():
     assert "```hermes_workflow" in prompt
     assert 'Allowed decisions: done, ready_for_testing' in prompt
     assert 'choose `ready_for_testing` only when actual testing is still pending' in prompt
+
+
+
+def test_store_session_metadata_derives_kanban_board_for_orchestrated_projects():
+    adapter = _make_adapter(
+        default_execution_mode="kanban_orchestrated",
+        project_kanban_boards={"Jax Control Plane": "jax-control-plane"},
+    )
+    payload = {
+        "action": "created",
+        "promptContext": (
+            '<issue identifier="PAB-143">'
+            '<project name="Jax Control Plane">'
+            'Repo: github.com/pablots99/jax-control-plane'
+            '</project>'
+            '</issue>'
+        ),
+        "agentSession": {
+            "id": "session-123",
+            "url": "https://linear.app/session/123",
+            "issue": {
+                "id": "issue-1",
+                "identifier": "PAB-143",
+                "title": "Capture metadata",
+                "project": {"id": "proj-1", "name": "Jax Control Plane"},
+                "labels": {"nodes": [{"name": "type:engineering"}]},
+            },
+        },
+        "appUserId": "app-user-1",
+    }
+
+    session = adapter._store_session_metadata(payload)
+
+    assert session["execution_mode"] == "kanban_orchestrated"
+    assert session["kanban_board_slug"] == "jax-control-plane"
+    assert session["kanban_board_source"] == "project_mapping"
+
+
+
+def test_store_session_metadata_auto_creates_kanban_board_when_missing(monkeypatch):
+    adapter = _make_adapter(
+        default_execution_mode="kanban_orchestrated",
+        project_kanban_boards={"Jax Control Plane": "jax-control-plane"},
+    )
+    created = {}
+
+    monkeypatch.setattr("gateway.platforms.linear.kanban_db.board_exists", lambda slug: False)
+
+    def _fake_create_board(slug, *, name=None, description=None, icon=None, color=None):
+        created.update({"slug": slug, "name": name, "description": description})
+        return {"slug": slug, "name": name, "description": description, "db_path": "/tmp/fake.db"}
+
+    monkeypatch.setattr("gateway.platforms.linear.kanban_db.create_board", _fake_create_board)
+
+    payload = {
+        "action": "created",
+        "promptContext": '<project name="Jax Control Plane">Repo: github.com/pablots99/jax-control-plane</project>',
+        "agentSession": {
+            "id": "session-123",
+            "issue": {
+                "id": "issue-1",
+                "identifier": "PAB-143",
+                "title": "Capture metadata",
+                "project": {"id": "proj-1", "name": "Jax Control Plane"},
+                "labels": {"nodes": [{"name": "type:engineering"}]},
+            },
+        },
+        "appUserId": "app-user-1",
+    }
+
+    session = adapter._store_session_metadata(payload)
+
+    assert created["slug"] == "jax-control-plane"
+    assert created["name"] == "Jax Control Plane"
+    assert session["kanban_board_auto_created"] is True
+    assert session["kanban_board_exists"] is True
+
+
+
+def test_build_prompt_for_created_event_includes_kanban_orchestration_guidance():
+    adapter = _make_adapter(
+        default_execution_mode="kanban_orchestrated",
+        project_kanban_boards={"Jax Control Plane": "jax-control-plane"},
+    )
+    payload = {
+        "action": "created",
+        "promptContext": (
+            '<issue identifier="PAB-80">'
+            '<project name="Jax Control Plane">'
+            'Repo: github.com/pablots99/jax-control-plane'
+            '</project>'
+            '</issue>'
+        ),
+        "guidance": [{"rule": "stay concise"}],
+        "agentSession": {
+            "id": "session-123",
+            "url": "https://linear.app/session/123",
+            "issue": {
+                "id": "issue-1",
+                "identifier": "PAB-80",
+                "title": "Linear agent",
+                "project": {"id": "proj-1", "name": "Jax Control Plane"},
+                "labels": {"nodes": [{"name": "type:ops"}]},
+            },
+        },
+        "appUserId": "app-user-1",
+    }
+
+    adapter._store_session_metadata(payload)
+    prompt = adapter._build_prompt(payload)
+
+    assert "Project execution mode: kanban_orchestrated" in prompt
+    assert "Hermes Kanban board: jax-control-plane" in prompt
+    assert "Linear is the human-facing control plane" in prompt
+    assert "Do not mirror every Kanban task back into Linear" in prompt
+    assert "started, blocked, needs approval, ready for testing, done" in prompt
+    assert "Linear ↔ Hermes Kanban" in prompt
+    assert "Kanban board: jax-control-plane" in prompt
+
+
+
+def test_reconciled_issue_prompt_includes_kanban_orchestration_guidance():
+    adapter = _make_adapter(default_execution_mode="kanban_orchestrated")
+    session = {
+        "project_name": "Jax Control Plane",
+        "task_type": "engineering",
+        "execution_mode": "kanban_orchestrated",
+        "kanban_board_slug": "jax-control-plane",
+    }
+    issue = {
+        "identifier": "PAB-80",
+        "title": "Close the execution gap",
+        "description": "Use Kanban for execution.",
+        "project": {"name": "Jax Control Plane"},
+    }
+
+    prompt = adapter._build_reconciled_issue_prompt(issue, session)
+
+    assert "Execution mode: kanban_orchestrated" in prompt
+    assert "Hermes Kanban board: jax-control-plane" in prompt
+    assert "Linear is the human-facing control plane" in prompt
+
+
+
+@pytest.mark.asyncio
+async def test_process_message_background_posts_kanban_start_comment_once(monkeypatch):
+    adapter = _make_adapter(default_execution_mode="kanban_orchestrated")
+    chat_id = "linear:session-1"
+    adapter._session_info[chat_id] = {
+        "agent_session_id": "session-1",
+        "app_user_id": "app-user-1",
+        "issue_id": "issue-1",
+        "issue_identifier": "PAB-80",
+        "issue_title": "Close the execution gap",
+        "team_id": "team-1",
+        "execution_mode": "kanban_orchestrated",
+        "kanban_board_slug": "jax-control-plane",
+        "kanban_board_source": "project_mapping",
+    }
+    source = adapter.build_source(
+        chat_id=chat_id,
+        chat_name="PAB-80",
+        chat_type="thread",
+        user_id="linear:user-1",
+        user_name="Pablo",
+    )
+    event = MessageEvent(
+        text="do work",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={},
+        message_id="message-1",
+    )
+    transitions = []
+    delegated = []
+
+    async def _fake_dependencies(_session):
+        return []
+
+    async def _fake_transition(session, target_state, *, assignee_id=None, comment=None):
+        transitions.append({"target_state": target_state, "comment": comment, "assignee_id": assignee_id})
+
+    async def _fake_super(self, event, session_key):
+        delegated.append((event.text, session_key))
+
+    monkeypatch.setattr(adapter, "_list_unresolved_dependencies", _fake_dependencies)
+    monkeypatch.setattr(adapter, "_transition_issue_for_session", _fake_transition)
+    monkeypatch.setattr("gateway.platforms.base.BasePlatformAdapter._process_message_background", _fake_super)
+
+    await adapter._process_message_background(event, "session-key-1")
+    await adapter._process_message_background(event, "session-key-2")
+
+    assert len(transitions) == 1
+    assert transitions[0]["target_state"] == adapter._in_progress_state_name
+    assert "Hermes Kanban" in transitions[0]["comment"]
+    assert "jax-control-plane" in transitions[0]["comment"]
+    assert len(delegated) == 2
 
 
 

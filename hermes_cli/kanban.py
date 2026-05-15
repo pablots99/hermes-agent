@@ -872,12 +872,17 @@ def kanban_command(args: argparse.Namespace) -> int:
         return 0
 
     # Board-management commands operate on board metadata and the persisted
-    # current-board pointer itself. They must ignore the shared `--board`
-    # task-routing override; otherwise `/kanban --board beta boards show`
-    # reports beta as the current board even when the on-disk pointer is
-    # alpha.
+    # current-board pointer itself. They must ignore both the shared `--board`
+    # task-routing override and any inherited HERMES_KANBAN_BOARD worker/session
+    # pin; otherwise board list/show can report the wrong current board after
+    # `boards switch` updated <root>/kanban/current on disk.
     if action == "boards":
-        return _dispatch_boards(args)
+        prev_board_env = os.environ.pop("HERMES_KANBAN_BOARD", None)
+        try:
+            return _dispatch_boards(args)
+        finally:
+            if prev_board_env is not None:
+                os.environ["HERMES_KANBAN_BOARD"] = prev_board_env
 
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
