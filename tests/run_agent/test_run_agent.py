@@ -162,6 +162,7 @@ def test_aiagent_accepts_session_metadata():
     ):
         agent = AIAgent(
             api_key="test-k...7890",
+            base_url="https://openrouter.ai/api/v1",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
