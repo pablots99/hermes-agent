@@ -3455,6 +3455,39 @@ class GatewaySlashCommandsMixin:
             logger.error("Insights command error: %s", e, exc_info=True)
             return t("gateway.insights.error", error=e)
 
+    async def _handle_codex_command(self, event: MessageEvent) -> str:
+        """Handle /codex command -- show rolling Codex usage windows."""
+        args = event.get_command_args().strip()
+        source = None
+        if args:
+            parts = args.split()
+            i = 0
+            while i < len(parts):
+                if parts[i] == "--source" and i + 1 < len(parts):
+                    source = parts[i + 1]
+                    i += 2
+                else:
+                    i += 1
+
+        try:
+            from hermes_state import SessionDB
+            from agent.codex_usage import CodexUsageTracker
+
+            loop = asyncio.get_running_loop()
+
+            def _run_codex_usage():
+                db = SessionDB()
+                tracker = CodexUsageTracker(db)
+                report = tracker.generate(source=source)
+                result = tracker.format_gateway(report)
+                db.close()
+                return result
+
+            return await loop.run_in_executor(None, _run_codex_usage)
+        except Exception as e:
+            logger.error("Codex command error: %s", e, exc_info=True)
+            return f"Error generating Codex usage: {e}"
+
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /reload-mcp — reconnect MCP servers and rebuild the cached agent.
 
