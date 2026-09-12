@@ -446,6 +446,15 @@ class TestVoiceReceiver:
         assert len(receiver._buffers) == 0
         assert len(receiver._ssrc_to_user) == 0
 
+    def test_custom_silence_threshold_is_clamped(self):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+        mock_vc = MagicMock()
+        mock_vc._connection.secret_key = [0] * 32
+        mock_vc._connection.dave_session = None
+        mock_vc._connection.ssrc = 9999
+        receiver = VoiceReceiver(mock_vc, silence_threshold_seconds=0.05)
+        assert receiver.SILENCE_THRESHOLD == 0.2
+
     def test_start_sets_running(self):
         receiver = self._make_receiver()
         receiver.start()
@@ -910,7 +919,9 @@ class TestDiscordVoiceChannelMethods:
         adapter._voice_input_callback = callback
         adapter._allowed_user_ids = set()
 
-        pcm_data = b"\x00" * 96000
+        # Audible 16-bit PCM (constant sample value 1000), above the live
+        # low-energy/noise rejection threshold.
+        pcm_data = b"\xe8\x03" * 48000
 
         with patch("plugins.platforms.discord.adapter.VoiceReceiver.pcm_to_wav"), \
              patch("tools.transcription_tools.transcribe_audio",

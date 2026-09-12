@@ -652,8 +652,17 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(self, voice_client, allowed_user_ids: set = None,
+                 silence_threshold_seconds: float = SILENCE_THRESHOLD):
         self._vc = voice_client
+        try:
+            # Keep end-of-turn detection configurable for conversational use.
+            # Values below 200ms tend to split natural intra-sentence pauses.
+            self.SILENCE_THRESHOLD = min(
+                5.0, max(0.2, float(silence_threshold_seconds))
+            )
+        except (TypeError, ValueError):
+            self.SILENCE_THRESHOLD = type(self).SILENCE_THRESHOLD
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
         self._secret_key: Optional[bytes] = None
@@ -3204,6 +3213,19 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             logger.debug("Could not load discord.%s config: %s", key, e)
             return default
 
+    def _load_discord_float_config(
+        self, key: str, default: float, *, minimum: float = 0.0, maximum: float = 60.0
+    ) -> float:
+        """Read and clamp a non-secret float from top-level ``discord`` config."""
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            raw = (cfg.get("discord") or {}).get(key, default)
+            return min(maximum, max(minimum, float(raw)))
+        except Exception as e:
+            logger.debug("Could not load discord.%s config: %s", key, e)
+            return default
+
     def _load_voice_timeout(self) -> int:
         """Return voice-channel inactivity timeout seconds; 0 disables it."""
         return self._load_discord_int_config(
@@ -3387,7 +3409,16 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if source is not None:
                 self._voice_sources[guild_id] = source
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                receiver = VoiceReceiver(
+                    vc,
+                    allowed_user_ids=self._allowed_user_ids,
+                    silence_threshold_seconds=self._load_discord_float_config(
+                        "voice_end_silence_seconds",
+                        VoiceReceiver.SILENCE_THRESHOLD,
+                        minimum=0.2,
+                        maximum=5.0,
+                    ),
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -3448,21 +3479,29 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             # ── Mixer path (overlap + ducking) ──────────────────────────────
             mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
             if mixer is not None:
-                decode_to_pcm = _voice_mixer_module().decode_to_pcm
-                pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
-                if pcm:
-                    speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
-                    mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
-                    # Block until speech drains so callers serialise replies; ambient keeps playing.
-                    wait_start = time.monotonic()
-                    while mixer.speech_active:
-                        if time.monotonic() - wait_start > playback_timeout:
-                            logger.warning("Mixer speech playback timed out after %.1fs", playback_timeout)
-                            mixer.stop_speech()
-                            break
-                        await asyncio.sleep(0.05)
-                    return True
-                logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
+                # Prevent speaker/microphone echo from being transcribed while the bot speaks.
+                receiver = self._voice_receivers.get(guild_id)
+                if receiver:
+                    receiver.pause()
+                try:
+                    decode_to_pcm = _voice_mixer_module().decode_to_pcm
+                    pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
+                    if pcm:
+                        speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
+                        mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
+                        # Block until speech drains so callers serialise replies; ambient keeps playing.
+                        wait_start = time.monotonic()
+                        while mixer.speech_active:
+                            if time.monotonic() - wait_start > playback_timeout:
+                                logger.warning("Mixer speech playback timed out after %.1fs", playback_timeout)
+                                mixer.stop_speech()
+                                break
+                            await asyncio.sleep(0.05)
+                        return True
+                    logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
+                finally:
+                    if receiver:
+                        receiver.resume()
             # Legacy one-shot path: pause receiver while playing (echo prevention).
             receiver = self._voice_receivers.get(guild_id)
             if receiver:
@@ -3657,6 +3696,22 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes):
         """Convert PCM -> WAV -> STT -> callback."""
         from tools.voice_mode import is_whisper_hallucination
+        # Opus comfort noise / an open but silent microphone can otherwise be
+        # turned into fluent-looking Whisper hallucinations. Filter obviously
+        # low-energy buffers before paying the STT cost.
+        min_rms = self._load_discord_int_config("voice_min_rms", 120, minimum=0)
+        if min_rms:
+            try:
+                import audioop
+                rms = audioop.rms(pcm_data, 2)
+                if rms < min_rms:
+                    logger.info(
+                        "Dropping low-energy voice input for user=%s: rms=%s threshold=%s",
+                        user_id, rms, min_rms,
+                    )
+                    return
+            except Exception:
+                logger.debug("Could not calculate Discord voice RMS", exc_info=True)
         tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
         wav_path = tmp_f.name
         tmp_f.close()

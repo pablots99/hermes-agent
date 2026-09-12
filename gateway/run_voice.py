@@ -245,6 +245,41 @@ class GatewayVoiceMixin:
         if not text_ch_id:
             return
         source = self._voice_input_source(adapter, guild_id, user_id, text_ch_id)
+        # Voice conversation prioritizes latency. When configured, seed this
+        # conversation with a fast model before the normal pipeline creates or
+        # reuses its agent. An explicit /model override still wins.
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            discord_cfg = cfg.get("discord") or {}
+            fast_model = str(discord_cfg.get("voice_response_model") or "").strip()
+            fast_provider = str(discord_cfg.get("voice_response_provider") or "").strip()
+            if fast_model:
+                session_key = self._session_key_for_source(source)
+                state = self._session_state(session_key)
+                if not state.conversation.model_override:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    runtime = await asyncio.to_thread(
+                        resolve_runtime_provider,
+                        requested=fast_provider or None,
+                        target_model=fast_model,
+                    )
+                    state.conversation.model_override = {
+                        "model": fast_model,
+                        "provider": runtime.get("provider") or fast_provider,
+                        "api_key": runtime.get("api_key"),
+                        "base_url": runtime.get("base_url"),
+                        "api_mode": runtime.get("api_mode"),
+                        "credential_pool": runtime.get("credential_pool"),
+                    }
+                    self._evict_cached_agent(session_key)
+                    logger.info(
+                        "Voice fast-model override for session=%s: model=%s provider=%s",
+                        session_key, fast_model,
+                        state.conversation.model_override.get("provider") or "(auto)",
+                    )
+        except Exception:
+            logger.warning("Could not apply Discord voice fast-model config", exc_info=True)
         # Validate the session owner against the current allowlist before auto-resuming. A session created
         # before TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or before the owner was removed from
         # it, must not silently receive a full agent response on gateway restart just because it has a
