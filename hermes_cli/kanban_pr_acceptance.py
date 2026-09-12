@@ -61,7 +61,14 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+            # Repository rulesets require GitHub Pro/Enterprise on private repos (HTTP 403
+            # "Upgrade to GitHub Pro"). Classic branch-protection required-checks (above) is
+            # already the authoritative source when rulesets are unavailable — do not let an
+            # unrelated plan limitation masquerade as missing PR evidence.
+            rules = []
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":

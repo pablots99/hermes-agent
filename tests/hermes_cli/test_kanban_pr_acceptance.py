@@ -25,6 +25,13 @@ def github(tmp_path, monkeypatch):
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
                         {"context": "required", "app": {"databaseId": 1}}]}}}}}}
             elif "/rules/branches/" in self.path:
+                if state.get("rules_403"):
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "message": "Upgrade to GitHub Pro or make this repository public "
+                                   "to enable this feature."}).encode())
+                    return
                 value = [[]]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
@@ -73,6 +80,28 @@ def github(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.mark.linux_only
+def test_pr_completion_survives_403_rulesets_when_classic_protection_present(github):
+    """Private repos without GitHub Pro get 403 on the rulesets endpoint; classic
+    branch-protection required-checks (already fetched via GraphQL) must still gate
+    acceptance instead of the whole receipt collapsing to 'infra'."""
+    with connect() as conn:
+        github.update(conclusion="success", head="a" * 40, rules_403=True)
+        tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
+        ok = kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert ok is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        receipts = [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))]
+        assert receipts[-1]["classification"] == "success"
+
+        github.update(conclusion="failure", head="a" * 40, rules_403=True)
+        tid2 = kb.create_task(conn, title="Publish2", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid2, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid2).status != "done"
 
 
 @pytest.mark.linux_only
